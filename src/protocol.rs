@@ -32,7 +32,7 @@ use std::io::{BufReader, BufWriter};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::{collections::HashMap, time::Duration};
-use tokio::sync::mpsc::{self, Sender};
+use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::sync::Mutex;
 use tokio::time;
 use tokio_stream::StreamExt;
@@ -114,6 +114,13 @@ impl<M: 'static + Middleware, W: 'static + Middleware, S: 'static + Signer> std:
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CreditService").finish()
     }
+}
+
+#[derive(Debug)]
+pub enum ProtocolError<M: 'static + Middleware, S: 'static + Signer> {
+    SignerMiddlewareError(SignerMiddlewareError<M, S>),
+    EthError,
+    Other(String),
 }
 
 impl<M: 'static + Middleware, W: 'static + Middleware, S: 'static + Signer> Protocol<M, W, S> {
@@ -234,55 +241,61 @@ impl<M: 'static + Middleware, W: 'static + Middleware, S: 'static + Signer> Prot
         }
     }
 
-    pub async fn launch(self) -> Result<Self, Self>
+    async fn debounce_liquidations(
+        service: Arc<Mutex<Self>>,
+        mut debounce_rx: Receiver<TaskActivity>,
+    ) {
+        let mut block_number = None;
+        let mut check_liquidations = false;
+        let mut liquidation_checked = false;
+        let mut last_gas_price = DEFAULT_GAS_PRICE;
+        let mut user = None;
+        loop {
+            let d = Duration::from_millis(2_000);
+            match time::timeout(d, debounce_rx.recv()).await {
+                Ok(Some(activity)) => match activity {
+                    TaskActivity::StartCheckLiquidation => check_liquidations = true,
+                    TaskActivity::StopCheckLiquidation => check_liquidations = false,
+                    TaskActivity::UpdateAll(block) => {
+                        block_number = block;
+                        liquidation_checked = false;
+                        user = None;
+                    }
+                    TaskActivity::UpdateUser((block, user_to_check)) => {
+                        block_number = block;
+                        liquidation_checked = false;
+                        user = Some(user_to_check);
+                    }
+                },
+                Ok(None) => {}
+                Err(_) => {
+                    if check_liquidations && !liquidation_checked {
+                        if let Some(block) = block_number {
+                            let lock = service
+                                .lock()
+                                .await
+                                .check_liquidations(block, &mut last_gas_price, user)
+                                .await;
+                            liquidation_checked = true;
+                            drop(lock);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    pub async fn launch(service: Arc<Mutex<Self>>) -> Result<(), ProtocolError<M, S>>
     where
         <M as Middleware>::Provider: PubsubClient,
     {
         const PAGE_SIZE: u64 = 5000;
 
-        let service = Arc::new(Mutex::new(self));
-        let (debounce_tx, mut debounce_rx) = mpsc::channel(10);
-        let me = Arc::clone(&service);
-        let a = tokio::spawn(async move {
-            let mut block_number = None;
-            let mut check_liquidations = false;
-            let mut liquidation_checked = false;
-            let mut last_gas_price = DEFAULT_GAS_PRICE;
-            let mut user = None;
-            loop {
-                let d = Duration::from_millis(2_000);
-                match time::timeout(d, debounce_rx.recv()).await {
-                    Ok(Some(activity)) => match activity {
-                        TaskActivity::StartCheckLiquidation => check_liquidations = true,
-                        TaskActivity::StopCheckLiquidation => check_liquidations = false,
-                        TaskActivity::UpdateAll(block) => {
-                            block_number = block;
-                            liquidation_checked = false;
-                            user = None;
-                        }
-                        TaskActivity::UpdateUser((block, user_to_check)) => {
-                            block_number = block;
-                            liquidation_checked = false;
-                            user = Some(user_to_check);
-                        }
-                    },
-                    Ok(None) => {}
-                    Err(_) => {
-                        if check_liquidations && !liquidation_checked {
-                            if let Some(block) = block_number {
-                                let lock = me
-                                    .lock()
-                                    .await
-                                    .check_liquidations(block, &mut last_gas_price, user)
-                                    .await;
-                                liquidation_checked = true;
-                                drop(lock);
-                            }
-                        }
-                    }
-                }
-            }
-        });
+        let (debounce_tx, debounce_rx) = mpsc::channel(10);
+        let debounce_liquidation = tokio::spawn(Self::debounce_liquidations(
+            Arc::clone(&service),
+            debounce_rx,
+        ));
         enum DataFrom<'a, M: Middleware, S: Signer>
         where
             <M as Middleware>::Provider: PubsubClient,
@@ -321,7 +334,7 @@ impl<M: 'static + Middleware, W: 'static + Middleware, S: 'static + Signer> Prot
                     if let Ok(logs) = result {
                         DataFrom::Log(logs)
                     } else {
-                        a.abort();
+                        debounce_liquidation.abort();
                         break 'filter;
                     }
                 } else {
@@ -386,17 +399,14 @@ impl<M: 'static + Middleware, W: 'static + Middleware, S: 'static + Signer> Prot
                             if let SignerMiddlewareError::MiddlewareError(m) = &e {
                                 error!("error to subscribe (middleware): {:#?}", m);
                             }
-                            panic!("subscribe disconnection: {:#?}", e);
+                            return Err(ProtocolError::SignerMiddlewareError(e));
                         }
                     }
                 }
             };
         }
-        a.abort();
-        // if error {
-        //     return Err(Arc::try_unwrap(service).unwrap().into_inner());
-        // }
-        Ok(Arc::try_unwrap(service).unwrap().into_inner())
+        debounce_liquidation.abort();
+        Ok(())
     }
 
     async fn update_price_lido(

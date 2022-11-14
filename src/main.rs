@@ -1,6 +1,8 @@
+use std::fmt::Debug;
 use std::panic;
 use std::process;
 use std::sync::Arc;
+use std::thread;
 use std::time::Duration;
 
 use ethers::prelude::k256::ecdsa::SigningKey;
@@ -21,13 +23,43 @@ mod generate_abi;
 
 pub use account::*;
 pub use exactly_events::*;
+use log::debug;
 use log::error;
 use log::info;
 pub use market::Market;
 pub use protocol::Protocol;
+pub use protocol::ProtocolError;
 use sentry::integrations::log::SentryLogger;
+use tokio::sync::Mutex;
 
 use crate::config::Config;
+
+type ExactlyProtocol = Protocol<Provider<Ws>, Provider<Http>, Wallet<SigningKey>>;
+
+fn retries<T, U>(provider_result: Result<T, U>, retries: usize) -> T
+where
+    U: Debug,
+{
+    let mut counter = 0;
+    loop {
+        match provider_result {
+            Ok(provider) => {
+                break provider;
+            }
+            Err(ref e) => {
+                if counter == retries {
+                    panic!(
+                        "Failed to connect to provider after {} retries\nerror:{:?}",
+                        retries, e
+                    );
+                }
+                counter += 1;
+                thread::sleep(Duration::from_secs(1));
+            }
+        }
+        thread::sleep(Duration::from_secs(1));
+    }
+}
 
 async fn create_client(
     config: &Config,
@@ -35,18 +67,14 @@ async fn create_client(
     Arc<SignerMiddleware<Provider<Ws>, Wallet<SigningKey>>>,
     Arc<SignerMiddleware<Provider<Http>, Wallet<SigningKey>>>,
 ) {
-    let provider_ws = loop {
-        let provider_result = Provider::<Ws>::connect(config.rpc_provider.clone()).await;
-        if let Ok(provider) = provider_result {
-            break provider;
-        }
-    };
-    let provider_https = loop {
-        let provider_result = Provider::<Http>::try_from(config.rpc_provider_relayer.clone());
-        if let Ok(provider) = provider_result {
-            break provider;
-        }
-    };
+    let provider_ws = retries(
+        Provider::<Ws>::connect(config.rpc_provider.clone()).await,
+        10,
+    );
+    let provider_https = retries(
+        Provider::<Http>::try_from(config.rpc_provider_relayer.clone()),
+        10,
+    );
     let wallet = config.wallet.clone().with_chain_id(config.chain_id);
     (
         Arc::new(SignerMiddleware::new(provider_ws, wallet.clone())),
@@ -92,8 +120,7 @@ async fn main() -> Result<()> {
 
     dbg!(&config);
 
-    let mut credit_service: Option<Protocol<Provider<Ws>, Provider<Http>, Wallet<SigningKey>>> =
-        None;
+    let mut credit_service: Option<Arc<Mutex<ExactlyProtocol>>> = None;
     let mut update_client = false;
     let mut last_client = None;
     loop {
@@ -102,28 +129,37 @@ async fn main() -> Result<()> {
                 if update_client {
                     info!("Updating client");
                     service
+                        .lock()
+                        .await
                         .update_client(Arc::clone(client), Arc::clone(client_relayer), &config)
                         .await;
                     update_client = false;
                 }
             } else {
                 info!("creating service");
-                credit_service = Some(
+                credit_service = Some(Arc::new(Mutex::new(
                     Protocol::new(Arc::clone(client), Arc::clone(client_relayer), &config).await?,
-                );
+                )));
             }
-            if let Some(service) = credit_service {
-                credit_service = match service.launch().await {
-                    Ok(current_service) => {
-                        println!("CREDIT SERVICE ERROR");
-                        Some(current_service)
+            if let Some(service) = &credit_service {
+                match Protocol::launch(Arc::clone(service)).await {
+                    Ok(()) => {
+                        break;
                     }
                     Err(e) => {
                         error!("credit service error: {:?}", e);
-
-                        // println!("error: {:?}", e);
-                        update_client = true;
-                        Some(e)
+                        match e {
+                            ProtocolError::SignerMiddlewareError(e) => {
+                                debug!("client will be recreated");
+                                error!("ProtocolError::SignerMiddlewareError: {:?}", e);
+                                update_client = true;
+                                last_client = None;
+                            }
+                            _ => {
+                                println!("ERROR");
+                                break;
+                            }
+                        }
                     }
                 }
             }
@@ -131,5 +167,5 @@ async fn main() -> Result<()> {
             last_client = Some(create_client(&config).await);
         }
     }
-    // Ok(())
+    Ok(())
 }
